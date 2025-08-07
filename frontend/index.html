@@ -1,0 +1,39 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Chat</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="background">
+    <div class="blob"></div>
+    <div class="blob"></div>
+  </div>
+
+  <div class="chat-container">
+    <header class="chat-header">
+      <h1>Kript</h1>
+      <button id="theme-toggle" class="theme-toggle" title="Toggle Dark/Light">🌙</button>
+    </header>
+
+    <div id="chat-body" class="chat-body"></div>
+
+    <form id="chat-form" class="chat-form">
+      <div class="tools-container">
+        <button type="button" id="tools-button" class="tools-button" title="Tools">TOOLS</button>
+        <div id="tools-menu" class="tools-menu hidden">
+          <label><input type="checkbox" id="search-toggle" /> Search</label>
+        </div>
+      </div>
+      <input id="chat-input" class="chat-input" type="text" placeholder="Type your message…" autocomplete="off" />
+      <button type="button" id="search-button" class="search-button hidden" title="Search">🔍</button>
+      <button type="submit" class="send-button">→</button>
+    </form>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
