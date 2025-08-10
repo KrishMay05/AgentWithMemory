@@ -6,7 +6,7 @@ import json
 import redis
 import requests
 from dotenv import load_dotenv
-from typing import TypedDict, Annotated, List, Union
+from typing import TypedDict, Annotated, List, Union, Dict, Any
 import operator
 import re # For parsing LLM output
 import uuid
@@ -17,10 +17,11 @@ import requests
 from bs4 import BeautifulSoup
 # LangGraph components
 from langgraph.graph import StateGraph, END
-
+from tools.search import smart_search
 # LangChain Core components for message types (still useful for structured history)
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool # For defining tools
+import traceback
 
 # Load environment variables
 load_dotenv()
@@ -79,7 +80,6 @@ To call a tool, reply with **only** a JSON object of this exact form:
 - For search_web, make your query specific and focused on what the user is asking.
 
 If you are absolutely certain you do **not** need a tool (for basic math, general knowledge that doesn't change, etc.), you may answer directly in natural language.
-
 Remember: When in doubt, use the tool. It's better to search and get current information than to provide potentially outdated data."""
 
     return sys_prompt
@@ -191,63 +191,42 @@ def get_current_weather(location: str) -> str:
 @tool
 def search_web(query: str, sentences: int = 3) -> str:
     """
-    Perform a quick lookup via Wikipedia and return the first few sentences.
-    Falls back to a Google-Custom-Search snippet fetch (up to 3 results), 
-    and if a snippet isn’t available, scrapes the first meaningful <p> from the page.
+    Smart web lookup using `smart_search` (Wikipedia/Wikidata, CSE with
+    extraction + passage ranking, freshness routing, etc.).
+    Returns a short synthesized answer with citations.
+
+    Args:
+        query: User's search query.
+        sentences: Kept for backward-compat; synthesis length is handled by smart_search.
     """
-    # 1) Try Wikipedia first
-    wikipedia.set_lang("en")
     try:
-        return wikipedia.summary(query, sentences=sentences, auto_suggest=False, redirect=True)
-    except DisambiguationError as e:
-        # Pick the first suggested page
-        choice = e.options[0]
-        try:
-            return wikipedia.summary(choice, sentences=sentences)
-        except Exception:
-            pass
-    except PageError:
-        pass
+        result: Dict[str, Any] = smart_search(query)
+        answer = result.get("answer") or "No answer produced."
+        cites: List[str] = result.get("citations") or []
 
-    # 2) Google CSE fallback
-    api_key = os.getenv("GOOGLE_API_KEY")
-    cse_id  = os.getenv("GOOGLE_CSE_ID")
-    if not api_key or not cse_id:
-        return "No Google API key or CSE ID configured."
+        # Deduplicate and trim citations a bit
+        seen = set()
+        deduped = []
+        for u in cites:
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            deduped.append(u)
+            if len(deduped) >= 3:  # keep it concise
+                break
 
-    try:
-        service = build("customsearch", "v1", developerKey=api_key)
-        res     = service.cse().list(q=query, cx=cse_id, num=3).execute()
+        if deduped:
+            lines = [answer, "", "Sources:"]
+            for i, u in enumerate(deduped, 1):
+                lines.append(f"{i}. {u}")
+            return "\n".join(lines)
+
+        return answer
+
     except Exception as e:
-        return f"Search failed: {e}"
-
-    items = res.get("items", [])
-    if not items:
-        return "No results found."
-
-    snippets = []
-    for item in items:
-        # 2a) Use the provided snippet if available
-        snippet = item.get("snippet")
-        if snippet:
-            snippets.append(snippet)
-            continue
-
-        # 2b) Otherwise, scrape the page for a long <p>
-        link = item.get("link")
-        try:
-            resp = requests.get(link, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for p in soup.find_all("p"):
-                text = p.get_text().strip()
-                if len(text) > 50:
-                    snippets.append(text)
-                    break
-        except Exception:
-            continue
-
-    return "\n\n".join(snippets) if snippets else "Found a page, but couldn’t extract a summary."
-
+        # Make failures readable to your agent logs but not crash the graph
+        tb = traceback.format_exc(limit=2)
+        return f"search_web failed: {e}\n{tb}"
 
 # List of tools available to the agent (used for parsing and execution)
 TOOLS = {
@@ -292,23 +271,74 @@ class Agent:
 
     def _parse_tool_call(self, llm_output: str) -> Union[dict, None]:
         """
-        Parses the LLM's output for a tool call in the assumed JSON format.
-        Assumed format: {"tool_call": {"name": "tool_name", "arguments": {...}}}
+        Extract {"tool_call": {...}} from llm_output even if surrounded by text.
+        Returns {"name": ..., "arguments": {...}} or None.
         """
         print('_parse_tool_call')
+
+        if not llm_output:
+            return None
+
+        s = llm_output.strip()
+
+        # 1) Strip code fences like ```json ... ``` or ``` ...
+        if s.startswith("```"):
+            fence_first_newline = s.find("\n")
+            if fence_first_newline != -1:
+                s = s[fence_first_newline + 1 :]
+            if s.endswith("```"):
+                s = s[:-3].strip()
+
+        # 2) Fast path: try direct JSON
         try:
-            data = json.loads(llm_output)
+            data = json.loads(s)
             if isinstance(data, dict) and "tool_call" in data and isinstance(data["tool_call"], dict):
-                tool_call = data["tool_call"]
-                if "name" in tool_call and "arguments" in tool_call:
-                    return {
-                        "name": tool_call["name"],
-                        "arguments": tool_call["arguments"]
-                    }
+                tc = data["tool_call"]
+                if "name" in tc and "arguments" in tc:
+                    return {"name": tc["name"], "arguments": tc["arguments"]}
         except json.JSONDecodeError:
-            pass # Not a JSON, or not the expected JSON structure
+            pass
+
+        # 3) Tolerant path: scan for the first balanced JSON object containing "tool_call"
+        idx = s.find('"tool_call"')
+        if idx == -1:
+            idx = s.find("'tool_call'")
+            if idx == -1:
+                return None
+
+        # find the nearest '{' before "tool_call"
+        start = s.rfind("{", 0, idx)
+        if start == -1:
+            return None
+
+        # walk forward to find the matching closing '}' using a brace counter
+        depth = 0
+        end = None
+        for i in range(start, len(s)):
+            ch = s[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+        if end is None:
+            return None
+
+        candidate = s[start:end]
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and "tool_call" in data and isinstance(data["tool_call"], dict):
+                tc = data["tool_call"]
+                if "name" in tc and "arguments" in tc:
+                    return {"name": tc["name"], "arguments": tc["arguments"]}
+        except json.JSONDecodeError:
+            return None
+
         return None
-    
+
     def _call_llm_node(self, state: AgentState) -> AgentState:
         # 1) Prepare
         # print('_call_llm_node')
@@ -412,24 +442,27 @@ class Agent:
         return g.compile()
 
     def handle(self, prompt: str, search: str = "false", user_id: str = "default") -> dict:
-        # 1) Build history + new prompt
         print('BEGIN HANDLE')
-        self.search_global = search
-        history  = self.memory.get_history(user_id)
-        messages = [HumanMessage(m["text"]) for m in history if m["role"] == "user"]
+
+        # --- treat search as a bool (see section 2)
+        self.search_global = (str(search).lower() == "true")
+
+        history = self.memory.get_history(user_id)
+
+        messages: List[BaseMessage] = []
+        for m in history:
+            if m["role"] == "user":
+                messages.append(HumanMessage(m["text"]))
+            elif m["role"] == "assistant":
+                messages.append(AIMessage(m["text"]))
+            elif m["role"] == "tool":
+                # If you don’t persist tool metadata, just inline as context
+                messages.append(HumanMessage(f"[tool:{m.get('name','unknown')}] {m['text']}"))
+
+        # new user turn
         messages.append(HumanMessage(prompt))
         self.memory.add_message(user_id, "user", prompt)
 
-        # 1a) Optional web search tool: if search flag is true, call search_web and include its result
-        # if isinstance(search, str) and search.lower() == "true":
-        #     # Perform the simulated web search
-        #     search_result = search_web(prompt)
-        #     # Append the tool output for context
-        #     messages.append(ToolMessage(content=search_result, name="search_web"))
-        #     # Store tool output in memory (optional)
-        #     self.memory.add_message(user_id, "tool", search_result)
-
-        # 2) Kick off the LangGraph flow
         overrides = {"configurable": {"thread_id": user_id}}
         states    = list(self.app.stream({"messages": messages}, overrides))
 
